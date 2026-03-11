@@ -93,14 +93,19 @@ struct DiEmbedImage {
     url: String,
 }
 
-#[post("/discord/{webhook_id}/{webhook_token}/misskey")]
+#[post("/discord/{webhook_id}/misskey")]
 async fn misskey_to_discord(
-    path: web::Path<(Snowflake, String)>,
+    req: actix_web::HttpRequest,
+    path: web::Path<Snowflake>,
     http_client: Data<Client>,
     dedup_note: Data<DedupNote>,
     payload: web::Json<JsonMap>,
 ) -> impl Responder {
-    let (webhook_id, webhook_token) = path.into_inner();
+    let webhook_id = path.into_inner();
+    let Some(webhook_token) = req.headers().get("X-Misskey-Hook-Secret").and_then(|v| v.to_str().ok()) else {
+        return HttpResponse::build(StatusCode::BAD_REQUEST).body("Missing X-Misskey-Hook-Secret header (used as Discord webhook token)");
+    };
+    let webhook_token = webhook_token.to_string();
 
     // see https://github.com/misskey-dev/misskey/pull/11752
     let Some(server) = payload.get("server").and_then(JsonValue::as_str) else {
