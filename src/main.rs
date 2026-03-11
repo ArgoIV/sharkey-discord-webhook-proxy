@@ -24,7 +24,7 @@ struct MiUser {
     username: String,
     host: Option<String>,
     #[serde(rename = "avatarUrl")]
-    avatar_url: String,
+    avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,11 +118,24 @@ async fn misskey_to_discord(
                 .body(format!("Unsupported event type: {ty}"))
         }
         Some("abuseReport") => {
-            // simple note webhook
             proxy_abuse_report_to_webhook(&payload, &http_client, webhook_id, &webhook_token).await
         }
-        Some("note" | "reply" | "mention" | "renote") => {
-            // simple note webhook
+        Some("userCreated") => {
+            proxy_user_created_to_webhook(&payload, &http_client, server, webhook_id, &webhook_token).await
+        }
+        Some("note" | "reply" | "mention" | "renote" | "edited") => {
+            proxy_note_to_webhook(
+                &payload,
+                &http_client,
+                &dedup_note,
+                server,
+                webhook_id,
+                &webhook_token,
+            )
+            .await
+        }
+        Some("localNote") => {
+            // system webhook: any local user posted a note
             proxy_note_to_webhook(
                 &payload,
                 &http_client,
@@ -160,16 +173,22 @@ async fn proxy_note_to_webhook(
     webhook_id: Snowflake,
     webhook_token: &str,
 ) -> HttpResponse {
-    let Some(note) = payload
-        .get("body")
-        .and_then(JsonValue::as_object)
+    // User webhooks wrap in {note: ...}, system webhooks (localNote) put note directly in body
+    let body = payload.get("body").and_then(JsonValue::as_object);
+    let note_value = body
         .and_then(|x| x.get("note"))
-    else {
-        return HttpResponse::build(StatusCode::BAD_REQUEST).body("webhokk payload not found");
+        .or_else(|| payload.get("body"));
+    let Some(note) = note_value else {
+        return HttpResponse::build(StatusCode::BAD_REQUEST).body("webhook payload not found");
     };
 
-    let Ok(note) = serde_json::from_value::<MiNote>(note.clone()) else {
-        return HttpResponse::build(StatusCode::BAD_REQUEST).body("webhokk payload parse error");
+    let note = match serde_json::from_value::<MiNote>(note.clone()) {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("webhook payload parse error: {e}");
+            return HttpResponse::build(StatusCode::BAD_REQUEST)
+                .body(format!("webhook payload parse error: {e}"));
+        }
     };
 
     {
@@ -217,7 +236,7 @@ async fn proxy_note_to_webhook(
         author: DiEmbedAuthor {
             name: format!("@{}", note.user.username),
             url: author_url,
-            icon_url: note.user.avatar_url,
+            icon_url: note.user.avatar_url.unwrap_or_default(),
         },
     };
 
@@ -226,6 +245,66 @@ async fn proxy_note_to_webhook(
         // mentions disallowed
         allowed_mentions: DiAllowedMentions { parse: [] },
         content: None,
+    };
+
+    let webhook_url = format!("https://discord.com/api/webhooks/{webhook_id}/{webhook_token}");
+
+    let response = http_client
+        .post(webhook_url)
+        .json(&payload)
+        .send()
+        .await
+        .expect("unexpected err");
+
+    if response.status().is_client_error() || response.status().is_server_error() {
+        log::error!(
+            "error response from discord: {}",
+            response.text().await.expect("unparseable error response")
+        );
+
+        return HttpResponse::build(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("discord returns error");
+    }
+
+    HttpResponse::build(StatusCode::CREATED).body("successfully created")
+}
+
+async fn proxy_user_created_to_webhook(
+    payload: &JsonMap,
+    http_client: &Client,
+    server: &str,
+    webhook_id: Snowflake,
+    webhook_token: &str,
+) -> HttpResponse {
+    let Some(body) = payload.get("body") else {
+        return HttpResponse::build(StatusCode::BAD_REQUEST).body("webhook payload not found");
+    };
+
+    let user = match serde_json::from_value::<MiUser>(body.clone()) {
+        Ok(u) => u,
+        Err(e) => {
+            log::error!("userCreated payload parse error: {e}");
+            return HttpResponse::build(StatusCode::BAD_REQUEST)
+                .body(format!("webhook payload parse error: {e}"));
+        }
+    };
+
+    let user_url = match &user.host {
+        None => format!("{server}/@{}", user.username),
+        Some(host) => format!("{server}/@{}@{host}", user.username),
+    };
+
+    let display_name = user.name.as_ref().unwrap_or(&user.username);
+
+    let content = format!(
+        "New account created: **{display_name}** (@{username})\n{user_url}",
+        username = user.username,
+    );
+
+    let payload = DiWebhookPayload {
+        embeds: vec![],
+        allowed_mentions: DiAllowedMentions { parse: [] },
+        content: Some(content),
     };
 
     let webhook_url = format!("https://discord.com/api/webhooks/{webhook_id}/{webhook_token}");
@@ -361,7 +440,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             // enable logger
             .wrap(middleware::Logger::default())
-            .app_data(web::JsonConfig::default().limit(4096)) // <- limit size of the payload (global configuration)
+            .app_data(web::JsonConfig::default().limit(1024 * 1024)) // <- limit size of the payload (1MB)
             .app_data(http_client.clone())
             .app_data(dedup_note.clone())
             .service(misskey_to_discord)
