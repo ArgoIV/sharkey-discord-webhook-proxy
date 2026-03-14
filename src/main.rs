@@ -54,6 +54,15 @@ struct MiAbuseReportPayload {
     comment: String,
 }
 
+#[derive(Deserialize)]
+struct MiAnnouncement {
+    title: String,
+    text: String,
+    #[serde(rename = "imageUrl")]
+    image_url: Option<String>,
+    icon: String,
+}
+
 // https://discord.com/developers/docs/resources/webhook#execute-webhook-jsonform-params
 #[derive(Serialize)]
 struct DiWebhookPayload {
@@ -74,9 +83,12 @@ struct DiEmbed {
     title: String,
     description: String,
     url: String,
-    timestamp: Timestamp,
-    //color: u32,
-    author: DiEmbedAuthor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author: Option<DiEmbedAuthor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image: Option<DiEmbedImage>,
 }
@@ -150,6 +162,9 @@ async fn misskey_to_discord(
                 &webhook_token,
             )
             .await
+        }
+        Some("announcement") => {
+            proxy_announcement_to_webhook(&payload, &http_client, server, webhook_id, &webhook_token).await
         }
         Some(ty) if ty.starts_with("note@") => {
             // nirila extension: admin other user webhook
@@ -236,13 +251,14 @@ async fn proxy_note_to_webhook(
         ),
         description: note.text.unwrap_or(String::from("(no content)")),
         url: format!("{server}/notes/{note_id}", note_id = note.id),
-        timestamp: note.created_at,
+        timestamp: Some(note.created_at),
+        color: None,
         image: di_image,
-        author: DiEmbedAuthor {
+        author: Some(DiEmbedAuthor {
             name: format!("@{}", note.user.username),
             url: author_url,
             icon_url: note.user.avatar_url.unwrap_or_default(),
-        },
+        }),
     };
 
     let payload = DiWebhookPayload {
@@ -327,6 +343,80 @@ async fn proxy_user_created_to_webhook(
             response.text().await.expect("unparseable error response")
         );
 
+        return HttpResponse::build(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("discord returns error");
+    }
+
+    HttpResponse::build(StatusCode::CREATED).body("successfully created")
+}
+
+async fn proxy_announcement_to_webhook(
+    payload: &JsonMap,
+    http_client: &Client,
+    server: &str,
+    webhook_id: Snowflake,
+    webhook_token: &str,
+) -> HttpResponse {
+    let Some(body) = payload.get("body").and_then(JsonValue::as_object) else {
+        return HttpResponse::build(StatusCode::BAD_REQUEST).body("webhook payload not found");
+    };
+    let Some(announcement_value) = body.get("announcement") else {
+        return HttpResponse::build(StatusCode::BAD_REQUEST).body("announcement field not found");
+    };
+
+    let announcement = match serde_json::from_value::<MiAnnouncement>(announcement_value.clone()) {
+        Ok(a) => a,
+        Err(e) => {
+            log::error!("announcement payload parse error: {e}");
+            return HttpResponse::build(StatusCode::BAD_REQUEST)
+                .body(format!("webhook payload parse error: {e}"));
+        }
+    };
+
+    let announcement_url = format!("{server}/announcements");
+
+    let icon_emoji = match announcement.icon.as_str() {
+        "warning" => "⚠️",
+        "error" => "❌",
+        "success" => "✅",
+        _ => "📢",
+    };
+
+    let embed = DiEmbed {
+        title: format!("{icon_emoji} {}", announcement.title),
+        description: announcement.text.clone(),
+        url: announcement_url,
+        timestamp: None,
+        color: Some(match announcement.icon.as_str() {
+            "warning" => 0xf0a500,
+            "error" => 0xe53935,
+            "success" => 0x43a047,
+            _ => 0x2196f3,
+        }),
+        image: announcement.image_url.map(|url| DiEmbedImage { url }),
+        author: None,
+    };
+
+    let discord_payload = DiWebhookPayload {
+        embeds: vec![embed],
+        allowed_mentions: DiAllowedMentions { parse: [] },
+        content: None,
+    };
+
+    let webhook_url = format!("https://discord.com/api/webhooks/{webhook_id}/{webhook_token}");
+
+    let response = http_client
+        .post(webhook_url)
+        .json(&discord_payload)
+        .send()
+        .await
+        .expect("unexpected err");
+
+    if response.status().is_client_error() || response.status().is_server_error() {
+        log::error!(
+            "error response from discord: {}",
+            response.text().await.expect("unparseable error response")
+        );
         return HttpResponse::build(StatusCode::INTERNAL_SERVER_ERROR)
             .body("discord returns error");
     }
